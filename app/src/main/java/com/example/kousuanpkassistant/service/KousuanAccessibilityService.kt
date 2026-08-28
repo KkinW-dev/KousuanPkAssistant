@@ -141,7 +141,11 @@ class KousuanAccessibilityService : AccessibilityService() {
         RuntimeControl.attach(this)
         AutomationStateStore.setServiceConnected(true, "无障碍服务已连接")
         refreshOverlay()
-        if (config.autoStartEnabled) scheduleAutoProbe(0L)
+        if (config.autoStartEnabled) {
+            scheduleAutoProbe(0L)
+        } else {
+            AutomationStateStore.appendLog("全自动当前关闭；需要时请在主界面打开")
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -246,6 +250,9 @@ class KousuanAccessibilityService : AccessibilityService() {
             nextScanAt = 0L
             AutomationStateStore.beginRun()
             AutomationStateStore.appendLog(
+                if (automatic) "启动来源：全自动识别" else "启动来源：手动开始按钮"
+            )
+            AutomationStateStore.appendLog(
                 "应用：${config.targetApp.displayName}；目标包：${config.targetPackages.joinToString()}；" +
                     "模式：${config.answerMode.displayName}"
             )
@@ -282,6 +289,12 @@ class KousuanAccessibilityService : AccessibilityService() {
 
     fun stopFromUser(reason: String): Boolean {
         if (!::configRepository.isInitialized) return false
+        if (config.autoStartEnabled && config.targetApp == TargetApp.ZUOYEBANG) {
+            AutomationStateStore.appendLog("已停止当前局；作业帮全自动保持开启，等待下一局")
+            val stopped = setAutomationRunning(false, reason)
+            if (stopped) scheduleAutoProbe(AUTO_REARM_SCAN_MS)
+            return stopped
+        }
         if (config.autoStartEnabled) {
             configRepository.setAutoStartEnabled(false)
             config = configRepository.load()
@@ -314,7 +327,11 @@ class KousuanAccessibilityService : AccessibilityService() {
         }
         refreshOverlay()
         AutomationStateStore.appendLog(
-            if (config.autoStartEnabled) "配置已重新载入；全自动待命" else "配置已重新载入"
+            if (config.autoStartEnabled) {
+                "配置已重新载入；全自动待命"
+            } else {
+                "配置已重新载入；全自动已关闭"
+            }
         )
     }
 
