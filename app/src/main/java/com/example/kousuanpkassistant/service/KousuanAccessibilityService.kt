@@ -1,6 +1,7 @@
 package com.example.kousuanpkassistant.service
 
 import android.Manifest
+import android.annotation.TargetApi
 import android.accessibilityservice.AccessibilityService
 import android.app.Notification
 import android.app.NotificationChannel
@@ -8,17 +9,20 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import com.example.kousuanpkassistant.R
 import com.example.kousuanpkassistant.RuntimeControl
 import com.example.kousuanpkassistant.automation.AccessibilityNodeQuestionReader
 import com.example.kousuanpkassistant.automation.ClickDispatcher
 import com.example.kousuanpkassistant.automation.UnimplementedScreenshotQuestionReader
+import com.example.kousuanpkassistant.automation.ZuoyebangVisualStartGate
 import com.example.kousuanpkassistant.data.ConfigRepository
 import com.example.kousuanpkassistant.model.AnswerMode
 import com.example.kousuanpkassistant.model.AutomationConfig
@@ -91,6 +95,15 @@ class KousuanAccessibilityService : AccessibilityService() {
     private var zuoyebangCompletedMatchSignature: String? = null
     private var zuoyebangQuestionPlanStartProgress = 0
     private var zuoyebangQuestionPlan: List<DetectedQuestion> = emptyList()
+    private val zuoyebangVisualStartGate = ZuoyebangVisualStartGate()
+    private var zuoyebangVisualGateSignature: String? = null
+    private var zuoyebangVisualGateGeneration = 0
+    private var zuoyebangVisualScreenshotInFlight = false
+    private var zuoyebangVisualGateLastRequestAt = 0L
+    private var zuoyebangVisualGateReady = false
+    private var zuoyebangVisualGateUnavailable = false
+    private var zuoyebangVisualGateStartedLogged = false
+    private var zuoyebangVisualGateFallbackLogged = false
 
     private val scanRunnable = Runnable {
         nextScanAt = 0L
@@ -224,6 +237,7 @@ class KousuanAccessibilityService : AccessibilityService() {
             zuoyebangCurrentMatchSignature = null
             zuoyebangQuestionPlanStartProgress = 0
             zuoyebangQuestionPlan = emptyList()
+            resetZuoyebangVisualStartGate()
             xiaoyuanStartGateOpen = config.targetApp != TargetApp.XIAOYUAN
             xiaoyuanWasArmedBeforeGameplay = false
             xiaoyuanGameplayReadyAt = 0L
@@ -236,7 +250,7 @@ class KousuanAccessibilityService : AccessibilityService() {
                     "模式：${config.answerMode.displayName}"
             )
             if (!screenshotReader.isAvailable) {
-                AutomationStateStore.appendLog("节点读取失败时不会截图：OCR 接口仅占位")
+                AutomationStateStore.appendLog("题目仍只读取节点：OCR 接口仅占位")
             }
             showSafetyNotification()
             refreshOverlay()
@@ -252,6 +266,7 @@ class KousuanAccessibilityService : AccessibilityService() {
             }
             running = false
             autoStartedCurrentRun = false
+            resetZuoyebangVisualStartGate()
             handler.removeCallbacks(scanRunnable)
             nextScanAt = 0L
             handler.removeCallbacks(watchdogRunnable)
@@ -610,6 +625,126 @@ class KousuanAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private fun resetZuoyebangVisualStartGate(signature: String? = null) {
+        zuoyebangVisualGateGeneration++
+        zuoyebangVisualGateSignature = signature
+        zuoyebangVisualScreenshotInFlight = false
+        zuoyebangVisualGateLastRequestAt = 0L
+        zuoyebangVisualGateReady = false
+        zuoyebangVisualGateUnavailable = false
+        zuoyebangVisualGateStartedLogged = false
+        zuoyebangVisualGateFallbackLogged = false
+        zuoyebangVisualStartGate.reset()
+    }
+
+    private fun requestZuoyebangVisualStartSample(signature: String, now: Long) {
+        if (zuoyebangVisualGateReady || zuoyebangVisualGateUnavailable) return
+        if (zuoyebangVisualGateSignature != signature) {
+            resetZuoyebangVisualStartGate(signature)
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            zuoyebangVisualGateUnavailable = true
+            AutomationStateStore.appendLog("系统版本不支持无障碍截图，使用 1.9 秒兜底")
+            return
+        }
+        if (zuoyebangVisualScreenshotInFlight ||
+            now - zuoyebangVisualGateLastRequestAt < ZUOYEBANG_VISUAL_SAMPLE_INTERVAL_MS
+        ) {
+            return
+        }
+        if (!zuoyebangVisualGateStartedLogged) {
+            zuoyebangVisualGateStartedLogged = true
+            AutomationStateStore.appendLog("作业帮开场：开始检测 READY/GO 画面变化")
+        }
+        takeZuoyebangVisualStartScreenshot(
+            generation = zuoyebangVisualGateGeneration,
+            requestedAt = now
+        )
+    }
+
+    @TargetApi(Build.VERSION_CODES.R)
+    private fun takeZuoyebangVisualStartScreenshot(generation: Int, requestedAt: Long) {
+        zuoyebangVisualScreenshotInFlight = true
+        zuoyebangVisualGateLastRequestAt = requestedAt
+        try {
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        val hardwareBuffer = screenshot.hardwareBuffer
+                        val bitmap = try {
+                            Bitmap.wrapHardwareBuffer(
+                                hardwareBuffer,
+                                screenshot.colorSpace
+                            )?.copy(Bitmap.Config.ARGB_8888, false)
+                        } finally {
+                            hardwareBuffer.close()
+                        }
+                        if (generation != zuoyebangVisualGateGeneration) {
+                            bitmap?.recycle()
+                            return
+                        }
+                        zuoyebangVisualScreenshotInFlight = false
+                        if (bitmap == null || bitmap.width <= 0 || bitmap.height <= 0) {
+                            bitmap?.recycle()
+                            disableZuoyebangVisualGate("截图画面不可读取")
+                            return
+                        }
+                        val elapsed = SystemClock.elapsedRealtime() - rapidBatchFirstSeenAt
+                        val decision = runCatching {
+                            zuoyebangVisualStartGate.analyze(bitmap, elapsed)
+                        }.getOrElse {
+                            Log.w(TAG, "visual start gate analysis failed", it)
+                            bitmap.recycle()
+                            disableZuoyebangVisualGate("画面分析失败")
+                            return
+                        }
+                        bitmap.recycle()
+                        Log.d(
+                            TAG,
+                            "visual-gate sample instance=$instanceId elapsed=${elapsed}ms " +
+                                "frame=${decision.frameDelta} baseline=${decision.baselineDelta} " +
+                                "stable=${decision.stableFrames} changed=${decision.changeSeen}"
+                        )
+                        if (decision.ready) {
+                            zuoyebangVisualGateReady = true
+                            AutomationStateStore.appendLog(
+                                "画面检测到开场遮罩结束：${elapsed}ms"
+                            )
+                            scheduleScan(0L)
+                        } else {
+                            scheduleScan(ZUOYEBANG_VISUAL_SAMPLE_INTERVAL_MS)
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        if (generation != zuoyebangVisualGateGeneration) return
+                        zuoyebangVisualScreenshotInFlight = false
+                        if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
+                            scheduleScan(ZUOYEBANG_VISUAL_SAMPLE_INTERVAL_MS)
+                            return
+                        }
+                        disableZuoyebangVisualGate("系统截图失败，错误码 $errorCode")
+                    }
+                }
+            )
+        } catch (throwable: Throwable) {
+            Log.w(TAG, "takeScreenshot failed", throwable)
+            if (generation == zuoyebangVisualGateGeneration) {
+                zuoyebangVisualScreenshotInFlight = false
+                disableZuoyebangVisualGate("系统拒绝截图")
+            }
+        }
+    }
+
+    private fun disableZuoyebangVisualGate(reason: String) {
+        if (zuoyebangVisualGateUnavailable) return
+        zuoyebangVisualGateUnavailable = true
+        AutomationStateStore.appendLog("$reason，使用 1.9 秒兜底")
+        scheduleScan(0L)
+    }
+
     private fun tryHandleRapidBatch(
         orderedQuestions: List<DetectedQuestion>,
         hasHandwritingArea: Boolean,
@@ -764,6 +899,9 @@ class KousuanAccessibilityService : AccessibilityService() {
         if (signature != rapidBatchSignature) {
             rapidBatchSignature = signature
             rapidBatchFirstSeenAt = now
+            if (!isXiaoyuan) {
+                resetZuoyebangVisualStartGate(signature)
+            }
             val first = questions.first()
             AutomationStateStore.updateDetection(
                 first.left.value,
@@ -782,19 +920,41 @@ class KousuanAccessibilityService : AccessibilityService() {
         }
 
         val readyRemaining = config.rapidStartDelayMs - (now - rapidBatchFirstSeenAt)
-        val zuoyebangAutoStartRemaining = if (!isXiaoyuan &&
+        val isZuoyebangAutomaticFirstBatch = !isXiaoyuan &&
             autoStartedCurrentRun &&
             alreadyCompleted == 0 &&
             actionAttemptCount == 0
-        ) {
+        val zuoyebangAutoStartRemaining = if (isZuoyebangAutomaticFirstBatch) {
             ZUOYEBANG_AUTO_START_SETTLE_MS - (now - rapidBatchFirstSeenAt)
         } else {
             0L
         }
-        if (zuoyebangAutoStartRemaining > 0L) {
-            AutomationStateStore.setStatus("已预读题组，等待 READY/GO 完整结束")
-            scheduleScan(minOf(zuoyebangAutoStartRemaining, RAPID_READY_SCAN_MS))
+        if (isZuoyebangAutomaticFirstBatch &&
+            !zuoyebangVisualGateReady &&
+            zuoyebangAutoStartRemaining > 0L
+        ) {
+            requestZuoyebangVisualStartSample(signature, now)
+            AutomationStateStore.setStatus(
+                if (zuoyebangVisualGateUnavailable) {
+                    "画面检测不可用，等待 1.9 秒安全兜底"
+                } else {
+                    "已预读题组，检测 READY/GO 画面结束"
+                }
+            )
+            scheduleScan(
+                minOf(
+                    zuoyebangAutoStartRemaining,
+                    ZUOYEBANG_VISUAL_SAMPLE_INTERVAL_MS
+                )
+            )
             return true
+        }
+        if (isZuoyebangAutomaticFirstBatch &&
+            !zuoyebangVisualGateReady &&
+            !zuoyebangVisualGateFallbackLogged
+        ) {
+            zuoyebangVisualGateFallbackLogged = true
+            AutomationStateStore.appendLog("画面未提前确认，按 1.9 秒兜底启动")
         }
         if (!isGameplayTimerRunning && readyRemaining > 0L) {
             AutomationStateStore.setStatus("已预读 $batchSize 题，等待开场动画结束")
@@ -1359,6 +1519,7 @@ class KousuanAccessibilityService : AccessibilityService() {
         const val ZUOYEBANG_FINAL_CONFIRM_TIMEOUT_MS = 6_000L
         const val ZUOYEBANG_PROGRESS_SETTLE_MS = 220L
         const val ZUOYEBANG_AUTO_START_SETTLE_MS = 1_900L
+        const val ZUOYEBANG_VISUAL_SAMPLE_INTERVAL_MS = 320L
         const val ZUOYEBANG_BLOCKING_OVERLAY_SCAN_MS = 50L
         const val MAX_ATTEMPTS_PER_QUESTION = 3
         const val XIAOYUAN_UNKNOWN_TOTAL_MAX_ATTEMPTS = 300

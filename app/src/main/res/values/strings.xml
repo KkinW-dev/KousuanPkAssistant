@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">口算 PK 助手</string>
     <string name="accessibility_service_label">口算 PK 节点读取服务</string>
-    <string name="accessibility_service_description">仅在配置的目标应用内读取可访问性节点，并按主界面的手动或全自动开关执行配置的点击动作。</string>
+    <string name="accessibility_service_description">仅在配置的目标应用内读取界面节点并执行配置的手势；作业帮全自动首批可短暂分析屏幕小区域判断开场结束，不保存截图，也不进行 OCR。</string>
     <string name="notification_channel_name">自动化安全控制</string>
     <string name="notification_title">口算 PK 自动化运行中</string>
     <string name="notification_stop">立即停止</string>

@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.kousuanpkassistant"
         minSdk = 26
         targetSdk = 35
-        versionCode = 49
-        versionName = "0.8.9"
+        versionCode = 50
+        versionName = "0.9.0"
 
         testInstrumentationRunner = "android.app.Instrumentation"
     }
